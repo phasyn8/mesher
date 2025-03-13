@@ -6,6 +6,104 @@ import pyvista as pv
 import gmsh
 import numpy as np
 import pandas as pd
+from collections import defaultdict
+
+''' Surface name and element accounting '''
+# Dimention and ID tracker, takes in surface gmsh element tags e.g. (dimention, ID's) tuples 
+# and their names and tracks changes passed from fragmentation operations or other boolean mesh operations
+
+class DimensionIDTracker:
+
+    ''' Initializes dictionary'''
+    def __init__(self):
+        self.data = {}  # Stores {(dim, id): name}
+        self.parent_child_map = defaultdict(list)  # Stores parent-child relationships
+    
+    def add_entry(self, dim_ids, names):
+        """
+        Adds multiple entries to the tracker.
+        :param dim_ids: List of tuples [(dimension, id), ...]
+        :param names: List of strings [name, ...]
+        """
+        if len(dim_ids) != len(names):
+            raise ValueError("Dimension ID list and names list must be of the same length.")
+        
+        for dim_id, name in zip(dim_ids, names):
+            if dim_id[0] not in {1, 2, 3}:
+                raise ValueError("Dimension must be 1, 2, or 3")
+            self.data[dim_id] = name
+    
+    def update_entries(self, parent_entries, child_entries):
+        """
+        Updates the tracker based on transformations.
+        :param parent_entries: List of tuples [(orig_dim, orig_id), ...]
+        :param child_entries: List of lists of tuples [[(new_dim. new_id)],[(new_dim, new_id), ...]...]
+        Parent and child entries must be mapped one old to one new entry
+        """
+        if len(parent_entries) != len(child_entries): 
+            raise ValueError("Original entries and new entries lists must be of the same length.")
+        
+        
+        for orig, children in zip(parent_entries, child_entries):
+            print("Orig: ",orig," Children: ",children)
+            if orig not in self.data:
+                    raise KeyError(f"Original entry {orig} not found.")
+            parent_name = self.data[orig]
+            print("Children: ",children)
+            if children == []: # this conditional may be soon depreciated, only remains for corner case
+                remove_name = "remove"
+                self.data[orig] = remove_name   
+            else:
+                for new in children:
+                    print(f"Adding {new} : {parent_name}")
+                    #parent_name = self.data[orig]
+                    self.data[new] = parent_name  # Inherit the name
+                    self.parent_child_map[orig].append(new)  # Track the split
+    
+    def get_hierarchy(self):
+        """
+        Returns the parent-child hierarchy as a dictionary.
+        """
+        return dict(self.parent_child_map)
+    
+    def lookup_name(self, dim_id):
+        """
+        Looks up the name associated with a given dimension ID.
+        :param dim_id: Tuple (dimension, id)
+        :return: Name string if found, otherwise None
+        """
+        return self.data.get(dim_id, None)
+    
+    def get_name_counts(self, by_dimension=False):
+        """
+        Returns a count of each unique name in the dictionary.
+        If by_dimension is True, returns a nested dictionary with counts per dimension.
+        """
+        if by_dimension:
+            name_counts = defaultdict(lambda: defaultdict(int))
+            for (dim, _), name in self.data.items():
+                name_counts[dim][name] += 1
+            return {dim: dict(names) for dim, names in name_counts.items()}
+        else:
+            name_counts = defaultdict(int)
+            for name in self.data.values():
+                name_counts[name] += 1
+            return dict(name_counts)
+    
+    def get_sorted_by_prefix(self):
+        """
+        Returns a list of lists where elements are grouped and sorted by name prefix.
+        """
+        prefix_groups = defaultdict(list)
+        
+        for dim_id, name in self.data.items():
+            prefix = name.split()[0] if " " in name else name  # Extract prefix
+            prefix_groups[prefix].append((dim_id, name))
+        
+        return [sorted(group, key=lambda x: x[1]) for group in prefix_groups.values()]
+    
+    def __repr__(self):
+        return f"Data: {self.data}\nParent-Child Map: {dict(self.parent_child_map)}"
 
 """ Worker functions NEED TO IMPLEMENT INTO A WOKRING CLASS """
 
@@ -60,7 +158,8 @@ def unique_points(list1, list2):
     unique_points_set = set1 - set2
     
     # Convert the resulting set back to a list of lists
-    unique_points_list = list(map(list, unique_points_set))
+    #unique_points_list = list(map(list, unique_points_set))
+    unique_points_list = list(map(tuple, unique_points_set))
     
     # Optional: Sort the list of unique points for consistency
     unique_points_list.sort()
@@ -139,6 +238,27 @@ def surf_list(surface_name="Surface_", start=1, end=2):
     #print(boundary_list)
     return boundary_list
 
+
+def sort_by_prefix(prefixes, strings):
+    """
+    Groups strings into lists based on their prefixes.
+
+    Parameters:
+    prefixes (list of str): List of prefixes.
+    strings (list of str): List of strings to be sorted.
+
+    Returns:
+    list of lists: A list where each sublist contains strings matching a prefix.
+    """
+    grouped = defaultdict(list)
+
+    for s in strings:
+        for prefix in prefixes:
+            if s.startswith(prefix):
+                grouped[prefix].append(s)
+                break  # Stop checking once a match is found
+
+    return [grouped[prefix] for prefix in prefixes]
 
 def export_divided_gmsh_volume_Compound_surface_accounting(
     surfaces, 
@@ -313,3 +433,149 @@ def export_divided_gmsh_volume_Compound_surface_accounting(
     gmsh.finalize()
     print(f"Mesh exported to {output_filename}")
     return fragment_ov, fragment_ovv, gmsh_surfaces, surface_physical_names, volume_names, exterior_surface_names
+
+def build_mesh_from_surfaces(all_surfaces=[], surface_names=[], volume_names=[], model_name="divided_volume", output_file='./mesher.msh', bounding_box=[0,1,0,1,0,1], fieldsize=500):
+
+    """
+    Finite Element Method (FEM) mesh constructor from "watertight" polydata surfaces.
+
+    Parameters:
+    all_surfaces [list of str.]: pyvista Polydata surfaces for dividing the mesh
+    names [list of str.]: names of surfaces, must be in corresponding order as
+    volume_names [list of str.]:
+    bounding_box [list]: extents of box volume  [ xmin, xmax, ymin, ymax, zmin, zmax ]
+    """ 
+
+    xmin, xmax, ymin, ymax, zmin, zmax = bounding_box
+    extents = (xmin, (xmax-xmin), ymin, (ymax-ymin), zmin, (zmax-zmin))
+
+    gmsh.initialize()
+    gmsh.model.add(model_name)
+
+        # Define a rectangular box in Gmsh using OCC kernel
+        #length, width, height = box_dimensions
+        #box = gmsh.model.occ.add_box(0, 0, 0, length, width, height)
+
+    box = gmsh.model.occ.add_box(extents[0], extents[2], extents[4], extents[1], extents[3], extents[5])
+        # Synchronize after adding the box
+    face_names =  ['West', 'East', 'South', 'North', 'Base', 'Top'] #box surfaces creation order (ZY- , ZY+ , ZX- , ZX+ , XY- , XY+) or (W, E, S, N, Dn, Up)
+    all_dim2_prefix = surface_names+face_names
+    
+    
+    tracker = DimensionIDTracker()
+    gmsh.model.occ.synchronize()
+
+
+    box_2dim = gmsh.model.occ.get_entities(dim=2)
+
+    tracker.add_entry(box_2dim, face_names)
+
+
+    for surface, name, vol_name in zip(all_surfaces, surface_names, volume_names):
+        # input for surface adding loop: surfaces (pv.Polydata), names (list of str)
+        points = surface.points
+        faces = surface.faces.reshape((-1, 4))[:, 1:]
+        #points.round(2), faces 
+
+        gmsh_points = []
+        #points = [(0,0,.5), (0,1,.5), (1,1,.5), (1,0,.5)]
+        for pt in points:
+            gmsh_points.append(gmsh.model.occ.add_point(pt[0], pt[1], pt[2]))
+        print("Points ",gmsh_points)
+
+        gmsh_curves = []
+        for face in faces:
+                lines = []
+                for j in range(len(face)):
+                    p1 = gmsh_points[face[j]]
+                    p2 = gmsh_points[face[(j + 1) % len(face)]]
+                    lines.append(gmsh.model.occ.add_line(p1, p2))
+                    print(f"line {lines} {j}")
+                loop = gmsh.model.occ.add_curve_loop(lines)
+                print("loop ", loop)
+                surface_tag = gmsh.model.occ.add_plane_surface([loop])
+                print("adding surface tag : ", surface_tag)
+                gmsh_curves.append(surface_tag)
+
+        print("Curves :", gmsh_curves)
+        
+        namer = [name] * len(gmsh_curves)
+        print(namer)
+        #adding surface tags and names to the name tracker 
+        tracker.add_entry([(2, plane_parts) for plane_parts in gmsh_curves], namer)
+    
+
+        gmsh.model.occ.synchronize()
+
+
+        #print("Box tags without dimension: ",boxtags)
+        vol = gmsh.model.occ.get_entities(dim=3) #original box
+        all_surf = gmsh.model.occ.get_entities(dim=2)
+
+        #Checking the current surfaces
+        print("All surface tags: ", all_surf)
+        print(all_surf)
+
+        #Checking the current volumes
+        #print("vol length ", len(vol), vol)
+
+        vol_namer = [vol_name] * len(vol)
+        print(vol_namer)
+
+        #Adding Names to the volumes in the name tracker, ** ToDo **  this is clumsy and has no logic yet..
+        tracker.add_entry(vol, vol_namer)
+        print("gmsh _curves ",gmsh_curves)
+    
+        box_surfaces = all_surf+vol
+
+        ovv, ov = gmsh.model.occ.fragment(box_surfaces, all_surf, removeTool=True, removeObject=True) #[(2, plane_parts) for plane_parts in gmsh_curves]
+        gmsh.model.occ.synchronize()
+        for e in zip(box_surfaces, ov):
+            print("parent " + str(e[0]) + " -> child " + str(e[1]))
+        print("ov = ",len(ov),ov)
+        print("ovv = ",len(ovv),ovv)
+
+        print("Box Surfaces = ", len(box_surfaces), box_surfaces)
+        tracker.update_entries(box_surfaces+all_surf, ov)
+
+    counts = tracker.get_name_counts(by_dimension=True)
+    #counts[2] holds the surface counts for the 2D surfaces with a certain name
+    #counts[3] holds the volumes counts for the number of 3D volumes
+
+
+    #grab all the 2D and 3D tags for the mesh
+    tags_3dim = gmsh.model.occ.get_entities(dim=3)
+    tags_2dim = gmsh.model.occ.get_entities(dim=2)
+
+
+    #print('Dim3 Tags: ', tags_3dim)
+    dim3_names_list = []
+    for tag in tags_3dim:
+        print('current tag 3', tag)
+        gmsh.model.add_physical_group(3, [tag[1]], tag=tag[1])
+        gmsh.model.set_physical_name(3, tag[1], f"{tracker.lookup_name(tag)}_{tag[1]:04d}")
+        dim3_names_list.append(f"{tracker.lookup_name(tag)}_{tag[1]:04d}")
+        counts[3][tracker.lookup_name(tag)] = counts[3][tracker.lookup_name(tag)]-1 #volumes physical group name is numbered by the remaining volumes that name, should count back to zero
+    #print("Dim 2 frag tags: ",tags_2dim)
+    dim2_names_list = []
+    for tag in tags_2dim:
+        print('current tag 2', tag)
+        gmsh.model.add_physical_group(2, [tag[1]], tag=tag[1])
+        #gmsh.model.set_physical_name(2, tag[1], f"{tracker.lookup_name(tag)}_{counts[2][tracker.lookup_name(tag)]+10000}") depreciated
+        gmsh.model.set_physical_name(2, tag[1], f"{tracker.lookup_name(tag)}_{counts[2][tracker.lookup_name(tag)]:04d}")
+        dim2_names_list.append(f"{tracker.lookup_name(tag)}_{counts[2][tracker.lookup_name(tag)]:04d}")
+        counts[2][tracker.lookup_name(tag)] = counts[2][tracker.lookup_name(tag)]-1 #surfaces physical group name is numbered by the remaining surfaces with that name, should count back to zero
+
+    dim2_sorted_surfaces = sort_by_prefix(all_dim2_prefix, dim2_names_list)
+    dim3_sorted_surfaces = sort_by_prefix(volume_names, dim3_names_list)
+    print(counts)
+
+    gmsh.model.occ.synchronize()
+    pnt_entities = gmsh.model.occ.get_entities(dim=0)
+    gmsh.model.mesh.setSize(pnt_entities, fieldsize)
+    #gmsh.option.setNumber("Mesh.MeshSizeMin", .3)
+    gmsh.model.mesh.generate(3)
+    gmsh.write(output_file)
+    gmsh.finalize()
+
+    return dim2_sorted_surfaces, dim3_sorted_surfaces
