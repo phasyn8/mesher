@@ -434,7 +434,9 @@ def export_divided_gmsh_volume_Compound_surface_accounting(
     print(f"Mesh exported to {output_filename}")
     return fragment_ov, fragment_ovv, gmsh_surfaces, surface_physical_names, volume_names, exterior_surface_names
 
-def build_mesh_from_surfaces(all_surfaces=[], surface_names=[], volume_names=[], model_name="divided_volume", output_file='./mesher.msh', bounding_box=[0,1,0,1,0,1], fieldsize=500):
+def build_mesh_from_surfaces(all_horizons=[], volume_names=[], vol_surface_names=[], all_faults=[], 
+                             fault_surface_names=[], model_name="divided_volume", output_file='./mesher.msh', 
+                             bounding_box=[0,1,0,1,0,1], fieldsize=500):
 
     """
     Finite Element Method (FEM) mesh constructor from "watertight" polydata surfaces.
@@ -456,23 +458,41 @@ def build_mesh_from_surfaces(all_surfaces=[], surface_names=[], volume_names=[],
         #length, width, height = box_dimensions
         #box = gmsh.model.occ.add_box(0, 0, 0, length, width, height)
 
-    box = gmsh.model.occ.add_box(extents[0], extents[2], extents[4], extents[1], extents[3], extents[5])
+    gmsh.model.occ.add_box(extents[0], extents[2], extents[4], extents[1], extents[3], extents[5])
+    box = gmsh.model.occ.get_entities(dim=3)
         # Synchronize after adding the box
     face_names =  ['West', 'East', 'South', 'North', 'Base', 'Top'] #box surfaces creation order (ZY- , ZY+ , ZX- , ZX+ , XY- , XY+) or (W, E, S, N, Dn, Up)
-    all_dim2_prefix = surface_names+face_names
+    
+    #collect all the surfaces naming components to sort dim2 element names after fragmenting
+    all_dim2_prefix = vol_surface_names+fault_surface_names+face_names
     
     
     tracker = DimensionIDTracker()
+    
     gmsh.model.occ.synchronize()
 
+    box = gmsh.model.occ.get_entities(dim=3)
 
     box_2dim = gmsh.model.occ.get_entities(dim=2)
 
     tracker.add_entry(box_2dim, face_names)
 
 
-    for surface, name, vol_name in zip(all_surfaces, surface_names, volume_names):
-        # input for surface adding loop: surfaces (pv.Polydata), names (list of str)
+    """ First Volume naming """
+
+
+    #print(box, volume_names[0])
+    # Adding Box surface face names
+    tracker.add_entry([box[0]], [volume_names[0]]) 
+
+
+    """_____________________________  STRATIGRAPHY FRAGMENTING LOOP __________________________________"""
+    # FIRST WE CUT THE BLOCK FROM THE BOTTOM UP WITH STRATIGRAPHY (FAULTS ARE HANDLED IN THE NEXT LOOP)
+    for surface, name, vol_name in zip(all_horizons, vol_surface_names, volume_names[1:]):
+        current_vols = gmsh.model.occ.get_entities(dim=3)
+
+        """Adding surfaces to OpenCascade"""
+
         points = surface.points
         faces = surface.faces.reshape((-1, 4))[:, 1:]
         #points.round(2), faces 
@@ -498,35 +518,36 @@ def build_mesh_from_surfaces(all_surfaces=[], surface_names=[], volume_names=[],
                 gmsh_curves.append(surface_tag)
 
         print("Curves :", gmsh_curves)
+
+        gmsh.model.occ.synchronize()
+        
         
         namer = [name] * len(gmsh_curves)
         print(namer)
-        #adding surface tags and names to the name tracker 
         tracker.add_entry([(2, plane_parts) for plane_parts in gmsh_curves], namer)
+
+        #gmsh.model.occ.synchronize()
     
+        all_2dim = gmsh.model.occ.get_entities(dim=2) #box creation order (ZY- , ZY+ , ZX- , ZX+ , XY- , XY+) or (W, E, S, N, Dn, Up)
+        print("Box 2 dim tags tuples: ", all_2dim)
 
-        gmsh.model.occ.synchronize()
+        box_3dim = gmsh.model.occ.get_entities(dim=3) #original box
+        
 
+        box_2dim = gmsh.model.occ.get_entities(dim=2)
+        boxtags = [tags[1] for tags in box_2dim]
 
-        #print("Box tags without dimension: ",boxtags)
-        vol = gmsh.model.occ.get_entities(dim=3) #original box
+        surf_dict = "surf"
+
+        print("Box tags without dimension: ",boxtags)
+
+        # return all dim2 surface elements from the current model
         all_surf = gmsh.model.occ.get_entities(dim=2)
-
-        #Checking the current surfaces
-        print("All surface tags: ", all_surf)
-        print(all_surf)
-
-        #Checking the current volumes
-        #print("vol length ", len(vol), vol)
-
-        vol_namer = [vol_name] * len(vol)
-        print(vol_namer)
-
-        #Adding Names to the volumes in the name tracker, ** ToDo **  this is clumsy and has no logic yet..
-        tracker.add_entry(vol, vol_namer)
-        print("gmsh _curves ",gmsh_curves)
     
-        box_surfaces = all_surf+vol
+        print("gmsh _curves ",gmsh_curves)
+        
+        #combine all the elements in the volume, we need them all so that the fragment operation reports all the parent child relationships correctly without gaps
+        box_surfaces = all_surf+box_3dim
 
         ovv, ov = gmsh.model.occ.fragment(box_surfaces, all_surf, removeTool=True, removeObject=True) #[(2, plane_parts) for plane_parts in gmsh_curves]
         gmsh.model.occ.synchronize()
@@ -534,18 +555,120 @@ def build_mesh_from_surfaces(all_surfaces=[], surface_names=[], volume_names=[],
             print("parent " + str(e[0]) + " -> child " + str(e[1]))
         print("ov = ",len(ov),ov)
         print("ovv = ",len(ovv),ovv)
-
+        
         print("Box Surfaces = ", len(box_surfaces), box_surfaces)
+        
+        # Identify all the dim3 volumes that were touched by the fragment
+        fraged_vols = filter_tuples_by_first_entry(ovv, 3)
+        
+        # Filter out the volumes that did not exist before the fragment (only new vols)
+        new_vols = unique_points(fraged_vols,current_vols)
+        
+        #repeat the current stratigraphy name that we are cutting
+        vol_namer = [vol_name] * len(new_vols)
+        
+        print("new vols: ", new_vols, "vol_namer: ", vol_namer)
+        # New elements inherit their parent names
         tracker.update_entries(box_surfaces+all_surf, ov)
+        # New volumes are given the new stratigraphy name
+        tracker.add_entry(new_vols, vol_namer)   
+
+
+    """_____________________________  FAULT FRAGMENTING LOOP __________________________________"""
+    # ORDER IS LESS OF AN ISSUE FOR THIS AS WE PROPAGATE VOLUME NAMES BY STRATIGRAPHY, 
+    # FOR CLEAN ORDERING, CONVENTION SHOULD BE FRAGMENT WEST TO EAST
+
+    for surface, name in zip(all_faults, fault_surface_names):
+        """Adding surfaces to OpenCascade"""
+
+        points = surface.points
+        faces = surface.faces.reshape((-1, 4))[:, 1:]
+        #points.round(2), faces 
+
+        gmsh_points = []
+        #points = [(0,0,.5), (0,1,.5), (1,1,.5), (1,0,.5)]
+        for pt in points:
+            gmsh_points.append(gmsh.model.occ.add_point(pt[0], pt[1], pt[2]))
+        print("Points ",gmsh_points)
+
+        gmsh_curves = []
+        for face in faces:
+                lines = []
+                for j in range(len(face)):
+                    p1 = gmsh_points[face[j]]
+                    p2 = gmsh_points[face[(j + 1) % len(face)]]
+                    lines.append(gmsh.model.occ.add_line(p1, p2))
+                    print(f"line {lines} {j}")
+                loop = gmsh.model.occ.add_curve_loop(lines)
+                print("loop ", loop)
+                surface_tag = gmsh.model.occ.add_plane_surface([loop])
+                print("adding surface tag : ", surface_tag)
+                gmsh_curves.append(surface_tag)
+        gmsh.model.occ.synchronize()
+        print("Curves :", gmsh_curves)
+        
+        namer = [name] * len(gmsh_curves)
+        print(namer)
+        tracker.add_entry([(2, plane_parts) for plane_parts in gmsh_curves], namer)
+
+        
+    
+        all_2dim = gmsh.model.occ.get_entities(dim=2) #box creation order (ZY- , ZY+ , ZX- , ZX+ , XY- , XY+) or (W, E, S, N, Dn, Up)
+        print("Box 2 dim tags tuples: ", all_2dim)
+
+        box_3dim = gmsh.model.occ.get_entities(dim=3) #original box
+        
+
+        box_2dim = gmsh.model.occ.get_entities(dim=2)
+        boxtags = [tags[1] for tags in box_2dim]
+
+        #surf_dict = "surf"
+
+        print("Box tags without dimension: ",boxtags)
+
+        # return all dim2 surface elements from the current model
+        all_surf = gmsh.model.occ.get_entities(dim=2)
+    
+        print("gmsh _curves ",gmsh_curves)
+        
+        #combine all the elements in the volume, we need them all so that the fragment operation reports all the parent child relationships correctly without gaps
+        box_surfaces = all_surf+box_3dim
+
+        ovv, ov = gmsh.model.occ.fragment(box_surfaces, all_surf, removeTool=True, removeObject=True) #[(2, plane_parts) for plane_parts in gmsh_curves]
+        gmsh.model.occ.synchronize()
+        for e in zip(box_surfaces, ov):
+            print("parent " + str(e[0]) + " -> child " + str(e[1]))
+        print("ov = ",len(ov),ov)
+        print("ovv = ",len(ovv),ovv)
+        
+        print("Box Surfaces = ", len(box_surfaces), box_surfaces)
+        
+        # Identify all the dim3 volumes that were touched by the fragment
+        #original_vols = filter_tuples_by_first_entry(ov, 3)
+        #fraged_vols = filter_tuples_by_first_entry(ovv, 3)
+        #for e in zip(fraged_vols, original_vols):
+        #    print("Volume parent " + str(e[0]) + " -> child " + str(e[1]))
+        # Filter out the volumes that did not exist before the fragment (only new vols)
+        #new_vols = msh.unique_points(fraged_vols, current_vols)
+        
+        #repeat the current stratigraphy name that we are cutting
+        #vol_namer = [vol_name] * len(new_vols)
+        
+        print("new vols: ", new_vols, "vol_namer: ", vol_namer)
+        # New elements inherit their parent names
+        comb_surf = box_surfaces+all_surf
+        tracker.update_entries(comb_surf[::-1], ov[::-1])
+        # New volumes are given the new stratigraphy name
+        #tracker.add_entry(original_vols, fraged_vols)   
+
+
 
     counts = tracker.get_name_counts(by_dimension=True)
-    #counts[2] holds the surface counts for the 2D surfaces with a certain name
-    #counts[3] holds the volumes counts for the number of 3D volumes
+    #counts[2]
 
-
-    #grab all the 2D and 3D tags for the mesh
     tags_3dim = gmsh.model.occ.get_entities(dim=3)
     tags_2dim = gmsh.model.occ.get_entities(dim=2)
+    #fragtags_dim2 = msh.filter_tuples_by_first_entry(ovv, 2)
 
 
     #print('Dim3 Tags: ', tags_3dim)
@@ -579,3 +702,4 @@ def build_mesh_from_surfaces(all_surfaces=[], surface_names=[], volume_names=[],
     gmsh.finalize()
 
     return dim2_sorted_surfaces, dim3_sorted_surfaces
+
