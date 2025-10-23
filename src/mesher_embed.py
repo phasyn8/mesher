@@ -645,7 +645,7 @@ def build_mesh_from_surfaces(all_horizons=[], volume_names=[], vol_surface_names
         #combine all the elements in the volume, we need them all so that the fragment operation reports all the parent child relationships correctly without gaps
         box_surfaces = all_surf+box_3dim
 
-        ovv, ov = gmsh.model.occ.fragment(box_surfaces, all_surf, removeTool=True, removeObject=True) #[(2, plane_parts) for plane_parts in gmsh_curves]
+        ovv, ov = gmsh.model.mesh.embed(2, all_surf, box_3dim, 3 )#, removeTool=True, removeObject=True) #[(2, plane_parts) for plane_parts in gmsh_curves]
         gmsh.model.occ.synchronize()
         #for e in zip(box_surfaces, ov):
             #print("parent " + str(e[0]) + " -> child " + str(e[1]))
